@@ -19,6 +19,23 @@
 - **至少一次投递 + 业务幂等 = 等价“恰好一次”**：Outbox + 唯一约束。
 - **同一订单簿顺序一致**：按 `instrumentId` 分片与顺序消费，事件带 `matchSeq`。
 
+### 1.3 全局工程规范（建议在开工前冻结）
+- **ID 与关联**
+  - **业务单号**：`orderId/tradeId/depositId/withdrawId/liquidationId/adlId/portfolioLiqId` 全局唯一。
+  - **关联 ID**：跨服务链路统一使用 `correlationId`（优先取业务单号，例如强平链路用 `liquidationId`）。
+  - **幂等键**：所有“扣钱/下单/提币/借贷”等写接口必须支持 `Idempotency-Key`；内部消息也要有 `idempotencyKey/clientOrderId`。
+- **金额与精度（强制）**
+  - **禁止使用 float/double**（包括前端与后端）。
+  - 统一使用 **定点整数（atomic amount）** 或 **BigDecimal + 固定 scale**；建议事件与存储采用 `amountAtomic` + `assetScale`（或资产表给定 scale）。
+  - 统一舍入规则（向下/银行家舍入）按业务类型固定，避免跨语言差异。
+- **时间与序号**
+  - 服务节点开启 NTP；事件统一携带 `occurredAtMs`。
+  - 撮合事件必须携带 `matchSeq`（同 `instrumentId` 单调递增）；深度事件携带 `bookSeq`（可复用 `matchSeq` 或独立）。
+- **唯一约束（落库）**
+  - Ledger：`(businessType, businessId)` 唯一。
+  - Deposit：EVM/TRON `(chainId, txHash, logIndex)` 唯一；BTC `(chainId, txHash, vout)` 唯一。
+  - Withdrawal：`withdrawId` 唯一；EVM 额外建议 `(chainId, fromAddress, nonce)` 唯一；BTC UTXO `(txHash, vout)` 唯一。
+
 ---
 
 ## 2) 逻辑架构与服务拆分
@@ -88,6 +105,15 @@
 
 **要求**：所有事件包含 `eventId`、`occurredAt`、`schemaVersion`、`correlationId`；交易事件必须带 `matchSeq`；消费端按幂等键去重。
 
+### 5.1 投递语义与一致性（必须）
+- **Outbox Pattern**：所有“写库 + 发 Kafka”的服务（`order/ledger/wallet/position/...`）必须用 outbox 表保证一致性。
+- **消费幂等**：所有消费者以业务唯一键去重（如 `tradeId`、`journalEntryId`、`depositId`、`withdrawId`），实现“至少一次投递”下的业务等价“恰好一次”。
+- **保留期建议**（用于回放/排障，按成本可调）
+  - `trading.trade_events`: 30d（至少 7d）
+  - `trading.order_events`: 14d（至少 3d）
+  - `market.book_delta_events`: 3d（至少 24h）
+  - `ledger.entries`: 30d（资金排障建议更长或永久入仓）
+
 ---
 
 ## 6) 撮合（Go）设计要点
@@ -128,6 +154,13 @@
 - 钱包：充值入账/冲正、提币冻结/在途/出账/解冻、归集/补热、gas 成本
 - 账本规则：`businessType + businessId` 唯一；借贷平衡校验；余额不可穿透。
 
+### 8.3 现货/杠杆“先冻结再撮合”的明确策略（建议默认）
+- **下单前冻结**（通过 Ledger）：`U.<sub>.Available -> U.<sub>.Frozen`，以 `orderId`/`clientOrderId` 幂等。
+- **成交结算**：撮合产出 `trade_events` 后，按 `tradeId` 幂等记账完成真实扣减/资产交换/手续费。
+- **撤单释放**：收到 `ORDER_CANCELED` 后，按 `orderId` 幂等释放冻结。
+
+> 这样风控与可用余额语义清晰，撮合无需依赖余额，且易审计与对账。
+
 ---
 
 ## 9) 钱包（上链）全量方案（EVM + TRON + BTC）
@@ -153,6 +186,17 @@
 ### 9.5 对账与熔断
 - 热/冷/保险基金地址集合的链上余额 ↔ 对应科目余额（解释项：`InFlight`）。
 - 差异不可解释：自动暂停提币（链/资产维度），触发工单与补偿任务（backfill/track-tx）。
+
+### 9.6 默认链参数（可作为初始值，按实际链稳定性调整）
+- **EVM L1（ETH）**：`minConfirmations=12`，`reorgWindow=256`，`creditPolicy=CONFIRMED_ONLY`
+- **EVM L2（ARB/OP 等）**：`minConfirmations=20`，`reorgWindow=512`，`creditPolicy=CONFIRMED_ONLY`
+- **TRON**：`minConfirmations=20`，`reorgWindow=512`，`creditPolicy=CONFIRMED_ONLY`
+- **BTC**：`minConfirmations=3~6(按金额分层)`，`reorgWindow=144`，`creditPolicy=CONFIRMED_ONLY`
+
+### 9.7 钱包状态机（摘要，落地时应固化枚举）
+- **Deposit**：`DETECTED -> PENDING_CONFIRMATION -> CONFIRMED -> CREDITED`，异常：`REORGED -> REVERSED`
+- **Withdrawal**：`REQUESTED -> RISK_REVIEW -> (APPROVAL_PENDING) -> APPROVED -> FROZEN -> TX_BUILDING -> TX_SIGNING -> TX_BROADCASTED -> TX_CONFIRMED -> DEBITED`，异常：`FAILED/CANCELLED -> UNFROZEN`
+- **Sweep/Replenish**：`CREATED -> TX_BUILDING -> TX_SIGNING -> TX_BROADCASTED -> TX_CONFIRMED -> ACCOUNTED`
 
 ---
 
@@ -185,6 +229,11 @@
 - 简化 SPAN：多情景冲击下的最差损失作为 `portfolioIM`，`portfolioMM` 用比例或独立情景计算；存 `risk_snapshot_portfolio` 便于审计。
 - 组合强平执行顺序（默认）：先减 Deriv 风险贡献最大仓位 → 收缩杠杆负债（卖现货还款）→ 再卖 Spot 降净敞口；每一步系统单均受调度器统一限流与优先级控制。
 
+### 10.7 费率/返佣/做市的入账口径（避免审计争议）
+- **手续费收入**：统一先记入 `P.FeeIncome:<asset>`。
+- **做市返佣/负 maker**：不要用“负手续费”隐式抵扣；建议单独业务类型 `FEE_REBATE`，以分录形式从 `P.FeeIncome -> U.<sub>.Available`（便于审计与报表）。
+- **系统订单标识**：强平/ADL/MM/组合强平的成交必须在 `trade_events` 与后续分录中可追踪（`source + correlationId + sliceId`）。
+
 ---
 
 ## 11) 系统订单调度器（order-service 内）
@@ -200,6 +249,10 @@
 - 推送时机：**投影落库后写入 event_store，再推送**，确保推送与查询一致。
 - WS：支持 `sinceEventId` 补发 + ACK；客户端去重（至少一次投递）。
 - 扇出与背压：Redis 维护 `userId -> sessions` 路由；高频事件合并（balance/position debounce）；慢连接断开后重连补发。
+
+### 12.1 断线兜底（必须）
+- 若 `sinceEventId` 已过期：服务端返回 `NEED_RESYNC`，客户端执行“全量刷新”（open orders / balances / positions）后再订阅。
+- 私有推送的 **真相一致性**：推送消息必须来自“已落库读模型”（或 event_store），避免“推送到了但查询不到”。
 
 ---
 
